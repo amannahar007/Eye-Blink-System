@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.env
+arduino-cli/
+arduino-cli.zip
+*.exe
+*.o
+*.a
+*.elf
+*.bin
+*.map
+Arduino IDE/
+.arduinoIDE/
