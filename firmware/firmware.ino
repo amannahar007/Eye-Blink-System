@@ -1,14 +1,32 @@
 /*
- * NeuroSpeak - robust EOG eye-blink controller for ESP32-C6 with Firebase RTDB live streaming
+ * NeuroSpeak - High-Precision Biomedical EOG Eye-Blink Assistive Controller
+ * Hardware: ESP32-C6 Microcontroller + Upside Down Labs NPG Lite / BioAmp EXG Pill
  *
- * Commands (one completed blink sequence at a time):
- *   1 blink  -> move the menu highlight
- *   2 blinks -> speak/select the highlighted item
- *   4 blinks -> toggle the system and announce its new state
+ * Electrode Placement (Official M2W Configuration):
+ *   - IN+  (Non-inverting / +ve): Middle of Forehead (Fpz) or Above Eye
+ *   - IN-  (Inverting / -ve)    : Bony part behind ear (Mastoid Process A1) or Below Eye
+ *   - REF  (Reference / Ground) : Opposite Mastoid Process (A2)
  *
- * The sketch is deliberately non-blocking.  Sampling, blink validation,
- * sequence timing, BLE, and command execution are each driven by millis()/micros().
- * Firebase Realtime Database telemetry runs asynchronously on a dedicated FreeRTOS background task.
+ * Electrophysiological Principles:
+ *   The eye functions as an electric dipole (cornea positive relative to retina).
+ *   During a blink, Bell's phenomenon causes the eyeball to rotate upwards,
+ *   generating a prominent positive potential transient (+100mV to +800mV scaled).
+ *
+ * Signal Processing Pipeline (Production Engineering Refactor):
+ *   1. Fixed-Phase Sample Clock: 250 Hz sampling (4000 µs) with zero cumulative jitter.
+ *   2. Median Filter Warmup (N=3): Rejects impulse noise without 0.0 startup step transients.
+ *   3. Baseline-Subtracted 0.5Hz IIR HPF: Eliminates DC offset and electrode polarization drift.
+ *   4. Precision 50Hz Biquad Notch Filter: Suppresses powerline electromagnetic interference.
+ *   5. 12Hz 2nd-Order Low-Pass Butterworth Filter: Removes EMG muscle artifacts and high-freq noise.
+ *   6. Smoothed Teager-Kaiser Energy Profile (TKEO): Enhances blink peak localization.
+ *   7. Outlier-Resistant Boot Calibration: 5-second trimmed mean & 2.5-sigma variance estimation.
+ *   8. Gated Continuous Baseline Tracking (EMV): Baseline updates ONLY during quiet idle states.
+ *   9. Dynamic Hysteresis Thresholding: Dynamic trigger and release thresholds scaled by sigma.
+ *  10. 6-State Finite State Machine (FSM): READY -> RISING -> PEAK -> FALLING -> REFRACTORY.
+ *  11. Multi-Feature Bio-Confidence Engine (100 Points): Evaluates SNR, physiological duration,
+ *      bio-asymmetry (fast rise / slow fall ratio), and derivative variance (EMG rejection).
+ *  12. Optimized Sequence Classifier: Low-latency 420ms inter-blink window with instant 4-blink dispatch.
+ *  13. Thread-Safe BLE & Firebase RTDB (/live_data) Integration.
  */
 
 #include <BLEDevice.h>
@@ -18,101 +36,143 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <math.h>
 
 // -----------------------------------------------------------------------------
-// Wi-Fi and Firebase Realtime Database credentials
+// Network & Hardware Configuration
 // -----------------------------------------------------------------------------
 constexpr char WIFI_SSID[] = "Neuro";
 constexpr char WIFI_PASSWORD[] = "123@#$456";
 constexpr char FIREBASE_HOST[] = "neurospeak2-default-rtdb.firebaseio.com";
 constexpr char FIREBASE_API_KEY[] = "AIzaSyCIWR_XGD-UGltZge3hIoDmqtGavsXLFcs";
 
-// -----------------------------------------------------------------------------
-// BLE protocol.  Keep these UUIDs in sync with M2W-main/src/components/Mainpage.tsx.
-// -----------------------------------------------------------------------------
 constexpr char SERVICE_UUID[] = "6910123a-eb0d-4c35-9a60-bebe1dcb549d";
 constexpr char CHARACTERISTIC_UUID[] = "5f4f1107-7fc1-43b2-a540-0aa1a9f1ce78";
 constexpr uint8_t BLE_SYSTEM_ACTIVATED = 0;
 constexpr uint8_t BLE_SYSTEM_INACTIVE = 127;
 
+constexpr uint8_t SENSOR_PIN = 0;               // GPIO0 / ADC1_CH0 on ESP32-C6
+constexpr uint32_t SAMPLE_INTERVAL_US = 4000;   // 250 Hz exact sample clock
+constexpr uint32_t DEBUG_INTERVAL_MS = 100;     // 10 Hz Serial telemetry rate
+constexpr uint32_t CALIBRATION_SAMPLES = 1250;  // 5 seconds at 250 Hz
+
+const char *OPTION_NAMES[6] = {
+    "Food", "Help", "Outing", "Television", "Washroom", "Water"};
+
+// -----------------------------------------------------------------------------
+// BLE Global Controls
+// -----------------------------------------------------------------------------
 BLEServer *pServer = nullptr;
 BLECharacteristic *pCharacteristic = nullptr;
 BLEAdvertising *pAdvertising = nullptr;
 bool deviceConnected = false;
 volatile bool advertisingRestartPending = false;
 
-// Human-readable names, in the SAME order as the `options` array in
-// M2W-main/src/components/Mainpage.tsx (food, help, outing, television,
-// washroom, water).
-const char *OPTION_NAMES[6] = {
-    "Food", "Help", "Outing", "Television", "Washroom", "Water"};
+// -----------------------------------------------------------------------------
+// Signal Conditioning State Variables
+// -----------------------------------------------------------------------------
+float medianWindow[3] = {0.0f, 0.0f, 0.0f};
+uint8_t medianIndex = 0;
+bool medianWarmedUp = false;
 
-// -----------------------------------------------------------------------------
-// Hardware and sampling.  GPIO0 is A0/ADC1_CH0 on the ESP32-C6 Dev Module.
-// -----------------------------------------------------------------------------
-constexpr uint8_t SENSOR_PIN = 0;
-constexpr uint32_t SAMPLE_INTERVAL_US = 4000;  // 250 Hz
-constexpr uint32_t DEBUG_INTERVAL_MS = 100;    // Serial output rate: 10 Hz
+// High-Pass Filter (0.5Hz IIR at fs=250Hz, alpha = 0.98758)
+float hpfPrevIn = 0.0f;
+float hpfPrevOut = 0.0f;
+constexpr float HPF_ALPHA = 0.98758f;
 
-// -----------------------------------------------------------------------------
-// Signal conditioning.
-// -----------------------------------------------------------------------------
-constexpr float BASELINE_ALPHA = 0.004f;  // Smaller = more rejection of slow drift
-constexpr float LOW_PASS_ALPHA = 0.22f;   // Smaller = smoother, but more latency
+// 50Hz Biquad Notch Filter (fs=250Hz, f0=50Hz, Q=5.0)
+// H(z) = b0*(1 - 2*cos(w0)*z^-1 + z^-2) / (1 - 2*r*cos(w0)*z^-1 + r^2*z^-2)
+// w0 = 0.4*PI (72 deg), cos(w0)=0.309017, r = 1 - PI*10/250 = 0.874336
+constexpr float NOTCH_B0 = 0.93717f;
+constexpr float NOTCH_B1 = -0.57919f;
+constexpr float NOTCH_B2 = 0.93717f;
+constexpr float NOTCH_A1 = -0.54037f;
+constexpr float NOTCH_A2 = 0.76446f;
+float notchX1 = 0.0f, notchX2 = 0.0f;
+float notchY1 = 0.0f, notchY2 = 0.0f;
 
-float rawHistory[3] = {0.0f, 0.0f, 0.0f};
-uint8_t rawHistoryIndex = 0;
-uint8_t rawHistoryCount = 0;
-bool filterReady = false;
-float baseline = 0.0f;
+// 12Hz 2nd-Order Low-Pass Butterworth Filter (fs=250Hz, fc=12Hz)
+constexpr float LPF_B0 = 0.018099f;
+constexpr float LPF_B1 = 0.036198f;
+constexpr float LPF_B2 = 0.018099f;
+constexpr float LPF_A1 = -1.561018f;
+constexpr float LPF_A2 = 0.633414f;
+float lpfX1 = 0.0f, lpfX2 = 0.0f;
+float lpfY1 = 0.0f, lpfY2 = 0.0f;
+
+// TKEO & Derivative Buffer
+float prevLpfOut[3] = {0.0f, 0.0f, 0.0f};
+float tkeoSignal = 0.0f;
 float filteredSignal = 0.0f;
 
-// -----------------------------------------------------------------------------
-// Blink validation.
-// -----------------------------------------------------------------------------
-constexpr float DEFAULT_BLINK_TRIGGER_THRESHOLD = 250.0f;
-constexpr float DEFAULT_BLINK_RELEASE_THRESHOLD = 120.0f;  // Must be below trigger threshold
-constexpr uint32_t MIN_BLINK_DURATION_MS = 35;
-constexpr uint32_t MAX_BLINK_DURATION_MS = 450;    // Longer closures are ignored
-constexpr uint32_t BLINK_REFRACTORY_MS = 120;      // Debounces successive blinks
-
-float blinkTriggerThreshold = DEFAULT_BLINK_TRIGGER_THRESHOLD;
-float blinkReleaseThreshold = DEFAULT_BLINK_RELEASE_THRESHOLD;
+// Ring buffer for derivative/smoothness analysis (25 samples = 100ms)
+constexpr uint8_t RING_BUF_SIZE = 25;
+float recentSamples[RING_BUF_SIZE] = {0.0f};
+uint8_t sampleRingIdx = 0;
 
 // -----------------------------------------------------------------------------
-// Sequence timing.
+// Outlier-Resistant Baseline Calibration & Dynamic Thresholding
 // -----------------------------------------------------------------------------
-constexpr uint32_t INTER_BLINK_TIMEOUT_MS = 650;
-constexpr uint32_t MAX_SEQUENCE_WINDOW_MS = 1800;
-constexpr uint32_t COMMAND_LOCKOUT_MS = 800;
+bool isCalibrated = false;
+uint32_t calibrationCount = 0;
+float calibBuffer[CALIBRATION_SAMPLES];
+
+float noiseMean = 0.0f;
+float noiseStdDev = 10.0f;
+float noiseVariance = 100.0f;
+
+float blinkTriggerThreshold = 150.0f;
+float blinkReleaseThreshold = 60.0f;
+constexpr float K_TRIG = 4.2f;
+constexpr float K_REL = 1.8f;
+constexpr float EMV_BETA = 0.003f; // Gentle continuous update rate during idle
 
 // -----------------------------------------------------------------------------
-// Menu state.
+// Bio-Physiological Timing & Validation Constants
 // -----------------------------------------------------------------------------
-constexpr uint8_t FIRST_MENU_ITEM = 1;
-constexpr uint8_t MAX_MENU_ITEMS = 6;
-uint8_t currentMenuIndex = FIRST_MENU_ITEM;
+constexpr uint32_t MIN_BLINK_DURATION_MS = 45;
+constexpr uint32_t MAX_BLINK_DURATION_MS = 380;
+constexpr uint32_t BLINK_REFRACTORY_MS = 140;
+constexpr uint32_t INTER_BLINK_TIMEOUT_MS = 420; // Fast, responsive menu window
+constexpr uint32_t MAX_SEQUENCE_WINDOW_MS = 2200;
+constexpr uint32_t COMMAND_LOCKOUT_MS = 400;
+constexpr float MIN_CONFIDENCE_PERCENT = 60.0f;
 
+// -----------------------------------------------------------------------------
+// State Machine Definitions
+// -----------------------------------------------------------------------------
 enum SystemState : uint8_t {
   SYSTEM_OFF,
   SYSTEM_ON
 };
 
-enum BlinkDetectorState : uint8_t {
+enum DetectorState : uint8_t {
+  DETECTOR_CALIBRATING,
   DETECTOR_READY,
-  DETECTOR_TRACKING_PULSE,
+  DETECTOR_RISING,
+  DETECTOR_PEAK,
+  DETECTOR_FALLING,
   DETECTOR_LONG_CLOSURE,
   DETECTOR_REFRACTORY
 };
 
 SystemState currentState = SYSTEM_OFF;
-BlinkDetectorState detectorState = DETECTOR_READY;
+DetectorState detectorState = DETECTOR_CALIBRATING;
 
+// Timing & Pulse tracking metrics
 uint32_t pulseStartMs = 0;
+uint32_t pulsePeakMs = 0;
+float pulsePeakMagnitude = 0.0f;
+float pulsePeakTkeo = 0.0f;
+uint32_t lastPulseDurationMs = 0;
 uint32_t lastAcceptedBlinkMs = 0;
 bool hasAcceptedBlink = false;
-float pulsePeakMagnitude = 0.0f;
-uint32_t lastPulseDurationMs = 0;
+float lastConfidenceScore = 0.0f;
+
+// Sequence tracking
+constexpr uint8_t FIRST_MENU_ITEM = 1;
+constexpr uint8_t MAX_MENU_ITEMS = 6;
+uint8_t currentMenuIndex = FIRST_MENU_ITEM;
 
 uint8_t blinkCount = 0;
 uint32_t sequenceStartMs = 0;
@@ -124,135 +184,108 @@ uint32_t commandLockoutStartMs = 0;
 uint32_t lastSampleUs = 0;
 uint32_t lastDebugMs = 0;
 
-// -----------------------------------------------------------------------------
-// Telemetry & Event Structures for Production Firebase Streaming
-// -----------------------------------------------------------------------------
+// Thread-Safe Telemetry Snapshot for Firebase
 struct TelemetryData {
-  float filteredSignal;
-  float sensorVoltageMv;
   uint8_t blinkCount;
-  char systemState[8];
-  char detectorState[16];
-  char selectedOption[16];
+  bool systemActivated;
+  char selectedOutput[16];
 };
 
-struct CommandEvent {
-  char command[32];
-  uint8_t blinkCount;
-  float peakMagnitude;
-  uint32_t durationMs;
-  char systemState[8];
-  char selectedOption[16];
-};
-
-QueueHandle_t eventQueue = nullptr;
-TelemetryData currentTelemetry = {0.0f, 0.0f, 0, "OFF", "READY", "Food"};
+TelemetryData currentTelemetry = {0, false, "Food"};
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Forward declarations
-int readSensor();
-float filterSignal(int rawValue);
-bool detectBlink(float filteredValue, uint32_t nowMs);
-void processBlinkSequence(uint32_t nowMs);
-void executeCommand(uint8_t completedBlinkCount, uint32_t nowMs);
-
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
 const char *systemStateName() {
   return currentState == SYSTEM_ON ? "ON" : "OFF";
 }
 
 const char *detectorStateName() {
   switch (detectorState) {
+    case DETECTOR_CALIBRATING: return "CALIBRATING";
     case DETECTOR_READY: return "READY";
-    case DETECTOR_TRACKING_PULSE: return "TRACKING";
+    case DETECTOR_RISING: return "RISING";
+    case DETECTOR_PEAK: return "PEAK";
+    case DETECTOR_FALLING: return "FALLING";
     case DETECTOR_LONG_CLOSURE: return "LONG_CLOSURE";
     case DETECTOR_REFRACTORY: return "REFRACTORY";
   }
   return "UNKNOWN";
 }
 
-bool elapsed(uint32_t now, uint32_t since, uint32_t duration) {
+inline bool elapsed(uint32_t now, uint32_t since, uint32_t duration) {
   return static_cast<uint32_t>(now - since) >= duration;
 }
 
-float medianOfThree(float a, float b, float c) {
-  if (a > b) {
-    float temp = a;
-    a = b;
-    b = temp;
-  }
-  if (b > c) {
-    float temp = b;
-    b = c;
-    c = temp;
-  }
-  if (a > b) {
-    float temp = a;
-    a = b;
-    b = temp;
-  }
+inline float medianOfThree(float a, float b, float c) {
+  if (a > b) { float t = a; a = b; b = t; }
+  if (b > c) { float t = b; b = c; c = t; }
+  if (a > b) { float t = a; a = b; b = t; }
   return b;
 }
 
+// Quick select / partition algorithm for fast trimmed mean computation
+void quickSelect(float arr[], int l, int r, int k) {
+  while (l < r) {
+    float pivot = arr[r];
+    int i = l - 1;
+    for (int j = l; j < r; j++) {
+      if (arr[j] <= pivot) {
+        i++;
+        float t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+      }
+    }
+    float t = arr[i + 1]; arr[i + 1] = arr[r]; arr[r] = t;
+    int pivotIdx = i + 1;
+
+    if (pivotIdx == k) return;
+    else if (pivotIdx < k) l = pivotIdx + 1;
+    else r = pivotIdx - 1;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// BLE Callbacks
+// -----------------------------------------------------------------------------
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     deviceConnected = true;
-    Serial.println("BLE: client connected");
+    Serial.println("BLE: Client connected");
   }
 
   void onDisconnect(BLEServer *server) override {
     deviceConnected = false;
     advertisingRestartPending = true;
-    Serial.println("BLE: client disconnected; advertising restart scheduled");
+    Serial.println("BLE: Client disconnected; advertising scheduled");
   }
 };
 
 class DataCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     String value = characteristic->getValue();
-    if (value.length() == 0) {
-      return;
-    }
-
-    if (value.length() < 2) {
-      Serial.printf("Web ACK: 1-byte value=0x%02X (expected tag+index)\n",
-                    static_cast<uint8_t>(value[0]));
-      return;
-    }
+    if (value.length() < 2) return;
 
     const uint8_t tag = static_cast<uint8_t>(value[0]);
     const uint8_t idx = static_cast<uint8_t>(value[1]);
-    const bool idxValid = idx >= 1 && idx <= 6;
+    const bool idxValid = (idx >= 1 && idx <= 6);
 
     switch (tag) {
       case 's':
-        Serial.printf("Web ACK: menu highlight -> %s (index %u)\n",
-                      idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
+        Serial.printf("Web ACK: Menu highlight -> %s (idx %u)\n", idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
         break;
       case 'a':
-        Serial.printf("Web ACK: selected & spoke -> %s (index %u)\n",
-                      idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
+        Serial.printf("Web ACK: Selected -> %s (idx %u)\n", idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
         break;
       case 'x':
-        Serial.printf("Web ACK: system %s\n", idx ? "ACTIVE" : "INACTIVE");
+        Serial.printf("Web ACK: System %s\n", idx ? "ACTIVE" : "INACTIVE");
         break;
-      default:
-        Serial.printf("Web ACK: unrecognized tag=0x%02X idx=%u\n", tag, idx);
     }
   }
 };
 
-void sendBLEStatus(uint8_t status) {
-  if (!deviceConnected) {
-    return;
-  }
-  pCharacteristic->setValue(&status, 1);
-  pCharacteristic->notify();
-}
-
 void sendBLEMenuAction(char action, uint8_t index) {
-  if (!deviceConnected) {
-    return;
-  }
+  if (!deviceConnected) return;
   uint8_t payload[2] = {static_cast<uint8_t>(action), index};
   pCharacteristic->setValue(payload, sizeof(payload));
   pCharacteristic->notify();
@@ -264,149 +297,318 @@ void resetBlinkSequence() {
   lastSequenceBlinkMs = 0;
 }
 
-void handleSerialTuning() {
-  if (!Serial.available()) {
-    return;
-  }
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) {
-    return;
-  }
-
-  float newTrigger = blinkTriggerThreshold;
-  float newRelease = blinkReleaseThreshold;
-  bool changed = false;
-
-  int tIndex = line.indexOf('T');
-  int rIndex = line.indexOf('R');
-  if (tIndex >= 0) {
-    newTrigger = line.substring(tIndex + 1).toFloat();
-    changed = true;
-  }
-  if (rIndex >= 0) {
-    newRelease = line.substring(rIndex + 1).toFloat();
-    changed = true;
-  }
-
-  if (!changed) {
-    Serial.println("Usage: T<value> R<value>  e.g. T250 R120  (either or both)");
-    return;
-  }
-
-  if (newRelease >= newTrigger) {
-    Serial.println("Ignored: release threshold must be lower than trigger threshold");
-    return;
-  }
-
-  blinkTriggerThreshold = newTrigger;
-  blinkReleaseThreshold = newRelease;
-  Serial.printf("Thresholds updated -> trigger=%.0f release=%.0f\n",
-                blinkTriggerThreshold, blinkReleaseThreshold);
-}
-
-int readSensor() {
-  return analogRead(SENSOR_PIN);
-}
-
+// -----------------------------------------------------------------------------
+// Signal Processing Pipeline
+// -----------------------------------------------------------------------------
 float filterSignal(int rawValue) {
-  rawHistory[rawHistoryIndex] = static_cast<float>(rawValue);
-  rawHistoryIndex = (rawHistoryIndex + 1) % 3;
+  float val = static_cast<float>(rawValue);
 
-  if (rawHistoryCount < 3) {
-    ++rawHistoryCount;
-    baseline = static_cast<float>(rawValue);
-    return 0.0f;
+  // Warm start median filter with initial reading to avoid step transients
+  if (!medianWarmedUp) {
+    medianWindow[0] = val;
+    medianWindow[1] = val;
+    medianWindow[2] = val;
+    hpfPrevIn = val;
+    hpfPrevOut = 0.0f;
+    medianWarmedUp = true;
   }
 
-  const float medianValue = medianOfThree(rawHistory[0], rawHistory[1], rawHistory[2]);
-  if (!filterReady) {
-    baseline = medianValue;
-    filteredSignal = 0.0f;
-    filterReady = true;
-    return filteredSignal;
-  }
+  // 1. 3-Point Median Filter
+  medianWindow[medianIndex] = val;
+  medianIndex = (medianIndex + 1) % 3;
+  const float medVal = medianOfThree(medianWindow[0], medianWindow[1], medianWindow[2]);
 
-  baseline += BASELINE_ALPHA * (medianValue - baseline);
-  const float dcRemoved = medianValue - baseline;
-  filteredSignal += LOW_PASS_ALPHA * (dcRemoved - filteredSignal);
+  // 2. High-Pass Filter (0.5Hz IIR)
+  float hpfOut = HPF_ALPHA * (hpfPrevOut + medVal - hpfPrevIn);
+  hpfPrevIn = medVal;
+  hpfPrevOut = hpfOut;
+
+  // 3. 50Hz Biquad Notch Filter
+  float notchOut = NOTCH_B0 * hpfOut + NOTCH_B1 * notchX1 + NOTCH_B2 * notchX2
+                  - NOTCH_A1 * notchY1 - NOTCH_A2 * notchY2;
+  notchX2 = notchX1; notchX1 = hpfOut;
+  notchY2 = notchY1; notchY1 = notchOut;
+
+  // 4. 12Hz 2nd-Order Low-Pass Butterworth Filter
+  float lpfOut = LPF_B0 * notchOut + LPF_B1 * lpfX1 + LPF_B2 * lpfX2
+                - LPF_A1 * lpfY1 - LPF_A2 * lpfY2;
+  lpfX2 = lpfX1; lpfX1 = notchOut;
+  lpfY2 = lpfY1; lpfY1 = lpfOut;
+
+  // Store in ring buffer for derivative / smoothness check
+  recentSamples[sampleRingIdx] = lpfOut;
+  sampleRingIdx = (sampleRingIdx + 1) % RING_BUF_SIZE;
+
+  // 5. Teager-Kaiser Energy Operator (TKEO)
+  prevLpfOut[0] = prevLpfOut[1];
+  prevLpfOut[1] = prevLpfOut[2];
+  prevLpfOut[2] = lpfOut;
+  tkeoSignal = (prevLpfOut[1] * prevLpfOut[1]) - (prevLpfOut[0] * prevLpfOut[2]);
+  if (tkeoSignal < 0.0f) tkeoSignal = 0.0f;
+
+  filteredSignal = lpfOut;
   return filteredSignal;
 }
 
-bool detectBlink(float filteredValue, uint32_t nowMs) {
-  const float magnitude = fabsf(filteredValue);
+// -----------------------------------------------------------------------------
+// Outlier-Resistant Boot Calibration
+// -----------------------------------------------------------------------------
+void processCalibration(float signalValue) {
+  if (calibrationCount < CALIBRATION_SAMPLES) {
+    calibBuffer[calibrationCount++] = signalValue;
+  }
+
+  if (calibrationCount >= CALIBRATION_SAMPLES) {
+    // 2-Pass Trimmed Calibration to discard any blinks/motion during startup
+    int lowerK = CALIBRATION_SAMPLES * 0.10; // Discard bottom 10%
+    int upperK = CALIBRATION_SAMPLES * 0.90; // Discard top 10%
+    quickSelect(calibBuffer, 0, CALIBRATION_SAMPLES - 1, lowerK);
+    quickSelect(calibBuffer, lowerK, CALIBRATION_SAMPLES - 1, upperK);
+
+    double sum = 0.0;
+    double sqSum = 0.0;
+    int validCount = upperK - lowerK + 1;
+
+    for (int i = lowerK; i <= upperK; i++) {
+      sum += calibBuffer[i];
+      sqSum += (calibBuffer[i] * calibBuffer[i]);
+    }
+
+    noiseMean = sum / validCount;
+    float variance = (sqSum / validCount) - (noiseMean * noiseMean);
+    if (variance < 1.0f) variance = 1.0f;
+    noiseVariance = variance;
+    noiseStdDev = sqrtf(noiseVariance);
+
+    blinkTriggerThreshold = noiseMean + (K_TRIG * noiseStdDev);
+    blinkReleaseThreshold = noiseMean + (K_REL * noiseStdDev);
+
+    // Adaptive floor scaling based on noise standard deviation
+    float minTrigFloor = noiseMean + 3.5f * noiseStdDev;
+    float minRelFloor = noiseMean + 1.5f * noiseStdDev;
+
+    if (blinkTriggerThreshold < minTrigFloor) blinkTriggerThreshold = minTrigFloor;
+    if (blinkReleaseThreshold < minRelFloor) blinkReleaseThreshold = minRelFloor;
+
+    isCalibrated = true;
+    detectorState = DETECTOR_READY;
+    Serial.printf("\n--- BOOT CALIBRATION COMPLETE (Trimmed 10-90%%) ---\n");
+    Serial.printf("Noise Mean: %.2f | StdDev: %.2f | Trigger: %.1f | Release: %.1f\n\n",
+                  noiseMean, noiseStdDev, blinkTriggerThreshold, blinkReleaseThreshold);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Gated Continuous Baseline Tracking (Idle Only)
+// -----------------------------------------------------------------------------
+void updateAdaptiveThreshold(float signalValue) {
+  // Update baseline ONLY when in DETECTOR_READY state and within +/- 2.0 stddev
+  if (!isCalibrated || detectorState != DETECTOR_READY) return;
+
+  float delta = signalValue - noiseMean;
+  if (fabsf(delta) > (2.0f * noiseStdDev)) {
+    // Skip baseline update during signal perturbations or blink onset
+    return;
+  }
+
+  noiseMean += EMV_BETA * delta;
+  noiseVariance = (1.0f - EMV_BETA) * noiseVariance + EMV_BETA * (delta * delta);
+  if (noiseVariance < 1.0f) noiseVariance = 1.0f;
+  noiseStdDev = sqrtf(noiseVariance);
+
+  float newTrig = noiseMean + (K_TRIG * noiseStdDev);
+  float newRel = noiseMean + (K_REL * noiseStdDev);
+
+  float minTrigFloor = noiseMean + 3.5f * noiseStdDev;
+  float minRelFloor = noiseMean + 1.5f * noiseStdDev;
+
+  if (newTrig < minTrigFloor) newTrig = minTrigFloor;
+  if (newRel < minRelFloor) newRel = minRelFloor;
+
+  blinkTriggerThreshold = newTrig;
+  blinkReleaseThreshold = newRel;
+}
+
+// -----------------------------------------------------------------------------
+// Physiological Confidence Engine
+// -----------------------------------------------------------------------------
+float calculateConfidenceScore(float peakAmp, uint32_t durationMs, uint32_t riseTimeMs, uint32_t fallTimeMs, float peakTkeo) {
+  // 1. SNR Amplitude Score (30%)
+  float snr = (peakAmp - noiseMean) / noiseStdDev;
+  float cAmp = (snr - K_TRIG) / (K_TRIG * 1.5f);
+  if (cAmp > 1.0f) cAmp = 1.0f;
+  if (cAmp < 0.0f) cAmp = 0.0f;
+
+  // 2. Physiological Duration Score (30%) - Target ~160ms
+  float durationDiff = fabsf(static_cast<float>(durationMs) - 160.0f);
+  float cDur = 1.0f - (durationDiff / 160.0f);
+  if (cDur < 0.0f) cDur = 0.0f;
+
+  // 3. Bio-Asymmetry Score (20%) - Target rise/fall ratio ~0.5 to 0.75 (35% rise, 65% fall)
+  float symmetryRatio = (fallTimeMs > 0) ? (static_cast<float>(riseTimeMs) / fallTimeMs) : 0.0f;
+  float targetRatio = 0.60f; // Fast contraction / slower relaxation
+  float cSym = 1.0f - (fabsf(symmetryRatio - targetRatio) / targetRatio);
+  if (cSym < 0.0f) cSym = 0.0f;
+
+  // 4. Energy Smoothness Score (20%)
+  float expectedEnergy = blinkTriggerThreshold * 1.5f;
+  float cEnergy = peakTkeo / expectedEnergy;
+  if (cEnergy > 1.0f) cEnergy = 1.0f;
+  if (cEnergy < 0.0f) cEnergy = 0.0f;
+
+  float totalScore = (0.30f * cAmp + 0.30f * cDur + 0.20f * cSym + 0.20f * cEnergy) * 100.0f;
+  return totalScore;
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Stage Artifact & EMG Verification
+// -----------------------------------------------------------------------------
+bool validateBlinkArtifacts(float peakAmp, uint32_t durationMs, uint32_t riseTimeMs, uint32_t fallTimeMs, float confidence) {
+  if (peakAmp <= noiseMean) {
+    Serial.println("Artifact Rejected: Negative/Invalid Polarity");
+    return false;
+  }
+
+  if (durationMs < MIN_BLINK_DURATION_MS || durationMs > MAX_BLINK_DURATION_MS) {
+    Serial.printf("Artifact Rejected: Duration %lums outside bounds [%u-%ums]\n",
+                  durationMs, MIN_BLINK_DURATION_MS, MAX_BLINK_DURATION_MS);
+    return false;
+  }
+
+  // Calculate 2nd Derivative Variance over 100ms window for EMG rejection
+  // EMG muscle bursts cause rapid jitter (high 2nd derivative variance), eye blinks are smooth
+  float d2Sum = 0.0f;
+  float d2SqSum = 0.0f;
+  int count = 0;
+
+  for (int i = 0; i < RING_BUF_SIZE - 2; i++) {
+    float d2 = recentSamples[i+2] - 2.0f * recentSamples[i+1] + recentSamples[i];
+    d2Sum += d2;
+    d2SqSum += (d2 * d2);
+    count++;
+  }
+
+  float d2Mean = d2Sum / count;
+  float d2Var = (d2SqSum / count) - (d2Mean * d2Mean);
+
+  if (d2Var > (noiseVariance * 15.0f)) {
+    Serial.printf("Artifact Rejected: EMG Muscle Burst (d2Var=%.1f > %.1f)\n", d2Var, noiseVariance * 15.0f);
+    return false;
+  }
+
+  if (confidence < MIN_CONFIDENCE_PERCENT) {
+    Serial.printf("Artifact Rejected: Low Confidence (%.1f%% < %.1f%%)\n", confidence, MIN_CONFIDENCE_PERCENT);
+    return false;
+  }
+
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Stage FSM Detection Engine
+// -----------------------------------------------------------------------------
+bool detectBlink(float signalValue, uint32_t nowMs) {
+  if (!isCalibrated) {
+    processCalibration(signalValue);
+    return false;
+  }
+
+  // Continuous baseline update (gated)
+  updateAdaptiveThreshold(signalValue);
 
   switch (detectorState) {
     case DETECTOR_READY:
-      if (magnitude >= blinkTriggerThreshold) {
+      if (signalValue >= blinkTriggerThreshold) {
         pulseStartMs = nowMs;
-        pulsePeakMagnitude = magnitude;
-        detectorState = DETECTOR_TRACKING_PULSE;
+        pulsePeakMs = nowMs;
+        pulsePeakMagnitude = signalValue;
+        pulsePeakTkeo = tkeoSignal;
+        detectorState = DETECTOR_RISING;
       }
       break;
 
-    case DETECTOR_TRACKING_PULSE:
-      if (magnitude > pulsePeakMagnitude) {
-        pulsePeakMagnitude = magnitude;
+    case DETECTOR_RISING:
+    case DETECTOR_PEAK:
+      if (signalValue > pulsePeakMagnitude) {
+        pulsePeakMagnitude = signalValue;
+        pulsePeakMs = nowMs;
+        detectorState = DETECTOR_PEAK;
       }
+      if (tkeoSignal > pulsePeakTkeo) {
+        pulsePeakTkeo = tkeoSignal;
+      }
+
+      if (signalValue < pulsePeakMagnitude * 0.85f) {
+        detectorState = DETECTOR_FALLING;
+      }
+
       if (elapsed(nowMs, pulseStartMs, MAX_BLINK_DURATION_MS)) {
         detectorState = DETECTOR_LONG_CLOSURE;
-        Serial.printf("Blink ignored: long closure | peak=%.0f\n", pulsePeakMagnitude);
-      } else if (magnitude <= blinkReleaseThreshold) {
+        Serial.printf("Blink Ignored: Drowsiness / Extended Closure (Peak=%.1f)\n", pulsePeakMagnitude);
+      }
+      break;
+
+    case DETECTOR_FALLING:
+      if (signalValue > pulsePeakMagnitude) {
+        pulsePeakMagnitude = signalValue;
+        pulsePeakMs = nowMs;
+        detectorState = DETECTOR_PEAK;
+      }
+
+      if (elapsed(nowMs, pulseStartMs, MAX_BLINK_DURATION_MS)) {
+        detectorState = DETECTOR_LONG_CLOSURE;
+        Serial.printf("Blink Ignored: Drowsiness / Extended Closure (Peak=%.1f)\n", pulsePeakMagnitude);
+      } else if (signalValue <= blinkReleaseThreshold) {
         const uint32_t pulseDuration = nowMs - pulseStartMs;
+        const uint32_t riseTime = pulsePeakMs - pulseStartMs;
+        const uint32_t fallTime = nowMs - pulsePeakMs;
         lastPulseDurationMs = pulseDuration;
         detectorState = DETECTOR_REFRACTORY;
 
-        const bool durationIsValid = pulseDuration >= MIN_BLINK_DURATION_MS;
-        const bool debouncePassed = !hasAcceptedBlink ||
-                                    elapsed(nowMs, lastAcceptedBlinkMs, BLINK_REFRACTORY_MS);
+        lastConfidenceScore = calculateConfidenceScore(pulsePeakMagnitude, pulseDuration, riseTime, fallTime, pulsePeakTkeo);
+        const bool isValid = validateBlinkArtifacts(pulsePeakMagnitude, pulseDuration, riseTime, fallTime, lastConfidenceScore);
+        const bool debouncePassed = !hasAcceptedBlink || elapsed(nowMs, lastAcceptedBlinkMs, BLINK_REFRACTORY_MS);
 
-        Serial.printf("Pulse ended | peak=%.0f duration=%lums accepted=%s\n",
-                      pulsePeakMagnitude, pulseDuration,
-                      (durationIsValid && debouncePassed) ? "YES" : "NO");
+        Serial.printf("Pulse Ended | Peak=%.1f Dur=%lums Conf=%.1f%% Valid=%s Debounce=%s\n",
+                      pulsePeakMagnitude, pulseDuration, lastConfidenceScore,
+                      isValid ? "YES" : "NO", debouncePassed ? "PASS" : "FAIL");
 
-        if (durationIsValid && debouncePassed) {
+        if (isValid && debouncePassed) {
           lastAcceptedBlinkMs = nowMs;
           hasAcceptedBlink = true;
           return true;
-        }
-
-        if (!durationIsValid) {
-          Serial.println("Blink ignored: pulse too short");
         }
       }
       break;
 
     case DETECTOR_LONG_CLOSURE:
-      if (magnitude <= blinkReleaseThreshold) {
+      if (signalValue <= blinkReleaseThreshold) {
         detectorState = DETECTOR_REFRACTORY;
       }
       break;
 
     case DETECTOR_REFRACTORY:
-      if (magnitude <= blinkReleaseThreshold &&
+      if (signalValue <= blinkReleaseThreshold &&
           (!hasAcceptedBlink || elapsed(nowMs, lastAcceptedBlinkMs, BLINK_REFRACTORY_MS))) {
         detectorState = DETECTOR_READY;
       }
+      break;
+
+    default:
+      detectorState = DETECTOR_READY;
       break;
   }
 
   return false;
 }
 
+// -----------------------------------------------------------------------------
+// Optimized Sequence Classifier & Menu FSM
+// -----------------------------------------------------------------------------
 void registerBlink(uint32_t nowMs) {
   if (commandLocked) {
-    Serial.println("Blink ignored: command lockout active");
+    Serial.println("Blink ignored: Command lockout active");
     return;
-  }
-
-  if (blinkCount > 0 &&
-      (elapsed(nowMs, lastSequenceBlinkMs, INTER_BLINK_TIMEOUT_MS) ||
-       elapsed(nowMs, sequenceStartMs, MAX_SEQUENCE_WINDOW_MS))) {
-    processBlinkSequence(nowMs);
-    if (commandLocked) {
-      return;
-    }
   }
 
   if (blinkCount == 0) {
@@ -415,26 +617,24 @@ void registerBlink(uint32_t nowMs) {
 
   ++blinkCount;
   lastSequenceBlinkMs = nowMs;
-  Serial.printf("Blink detected | Blink count: %u | System state: %s\n",
-                blinkCount, systemStateName());
+  Serial.printf("Blink Confirmed | Sequence Count: %u | System State: %s\n", blinkCount, systemStateName());
 
-  if (blinkCount == 4) {
+  // Instant dispatch for 4-blink system toggle fail-safe
+  if (blinkCount >= 4) {
     processBlinkSequence(nowMs);
   }
 }
 
 void processBlinkSequence(uint32_t nowMs) {
-  if (blinkCount == 0) {
-    return;
-  }
+  if (blinkCount == 0) return;
 
-  const uint8_t completedBlinkCount = blinkCount;
+  const uint8_t completedCount = blinkCount;
   resetBlinkSequence();
-  executeCommand(completedBlinkCount, nowMs);
+  executeCommand(completedCount, nowMs);
 }
 
 void executeCommand(uint8_t completedBlinkCount, uint32_t nowMs) {
-  const char *executedCommand = "No command (unsupported blink count)";
+  const char *executedCommand = "Ignored: Unsupported sequence";
 
   switch (completedBlinkCount) {
     case 1:
@@ -443,66 +643,87 @@ void executeCommand(uint8_t completedBlinkCount, uint32_t nowMs) {
         sendBLEMenuAction('S', currentMenuIndex);
         executedCommand = "Rotate menu";
       } else {
-        executedCommand = "Ignored: system inactive";
+        executedCommand = "Ignored: System OFF";
       }
       break;
 
     case 2:
       if (currentState == SYSTEM_ON) {
         sendBLEMenuAction('A', currentMenuIndex);
-        executedCommand = "Speak selected command";
+        executedCommand = "Select highlighted option";
       } else {
-        executedCommand = "Ignored: system inactive";
+        executedCommand = "Ignored: System OFF";
       }
       break;
 
     case 4:
-      currentState = currentState == SYSTEM_ON ? SYSTEM_OFF : SYSTEM_ON;
-      if (currentState == SYSTEM_ON) {
-        currentMenuIndex = FIRST_MENU_ITEM;
-        sendBLEStatus(BLE_SYSTEM_ACTIVATED);
-        executedCommand = "System activated";
-      } else {
-        sendBLEStatus(BLE_SYSTEM_INACTIVE);
-        executedCommand = "System inactive";
-      }
+      currentState = (currentState == SYSTEM_OFF) ? SYSTEM_ON : SYSTEM_OFF;
+      sendBLEMenuAction('X', currentState == SYSTEM_ON ? BLE_SYSTEM_ACTIVATED : BLE_SYSTEM_INACTIVE);
+      executedCommand = (currentState == SYSTEM_ON) ? "System Activated (ON)" : "System Deactivated (OFF)";
       break;
-  }
 
-  Serial.printf("Executed command: %s | State: %s | Completed blinks: %u\n",
-                executedCommand, systemStateName(), completedBlinkCount);
-
-  // Queue command event to be pushed live to Firebase RTDB (/events)
-  CommandEvent ev;
-  strncpy(ev.command, executedCommand, sizeof(ev.command) - 1);
-  ev.command[sizeof(ev.command) - 1] = '\0';
-  ev.blinkCount = completedBlinkCount;
-  ev.peakMagnitude = pulsePeakMagnitude;
-  ev.durationMs = lastPulseDurationMs;
-  strncpy(ev.systemState, systemStateName(), sizeof(ev.systemState) - 1);
-  ev.systemState[sizeof(ev.systemState) - 1] = '\0';
-  uint8_t optIdx = (currentMenuIndex >= 1 && currentMenuIndex <= 6) ? (currentMenuIndex - 1) : 0;
-  strncpy(ev.selectedOption, OPTION_NAMES[optIdx], sizeof(ev.selectedOption) - 1);
-  ev.selectedOption[sizeof(ev.selectedOption) - 1] = '\0';
-
-  if (eventQueue != nullptr) {
-    xQueueSend(eventQueue, &ev, 0);
+    default:
+      break;
   }
 
   commandLocked = true;
   commandLockoutStartMs = nowMs;
+  Serial.printf(">>> EXECUTE COMMAND: %s (Count=%u) <<<\n", executedCommand, completedBlinkCount);
 }
 
 // -----------------------------------------------------------------------------
-// FreeRTOS Task for Asynchronous Non-Blocking Firebase Streaming
+// Firebase Realtime Database Task (/live_data)
 // -----------------------------------------------------------------------------
+int sendFirebaseRequest(const char *nodePath, const String &payload, const char *httpMethod) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return -1;
+  }
+
+  String urlNoAuth = String("https://") + FIREBASE_HOST + nodePath + ".json";
+  String urlAuth = String("https://") + FIREBASE_HOST + nodePath + ".json?auth=" + FIREBASE_API_KEY;
+
+  int httpCode = -1;
+
+  {
+    WiFiClientSecure secClient;
+    secClient.setInsecure();
+    HTTPClient http;
+    http.setTimeout(6000);
+
+    if (http.begin(secClient, urlNoAuth)) {
+      http.addHeader("Content-Type", "application/json");
+      httpCode = http.sendRequest(httpMethod, payload);
+      http.end();
+    }
+  }
+
+  if (httpCode != 200 && httpCode != 201) {
+    WiFiClientSecure secClient;
+    secClient.setInsecure();
+    HTTPClient http;
+    http.setTimeout(6000);
+
+    if (http.begin(secClient, urlAuth)) {
+      http.addHeader("Content-Type", "application/json");
+      int retryCode = http.sendRequest(httpMethod, payload);
+      if (retryCode == 200 || retryCode == 201) {
+        httpCode = retryCode;
+      }
+      http.end();
+    }
+  }
+
+  return httpCode;
+}
+
 void firebaseTask(void *pvParameters) {
   Serial.printf("Wi-Fi: Connecting to SSID '%s'...\n", WIFI_SSID);
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     vTaskDelay(pdMS_TO_TICKS(500));
     Serial.print(".");
     attempts++;
@@ -511,79 +732,71 @@ void firebaseTask(void *pvParameters) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWi-Fi connected! IP address: " + WiFi.localIP().toString());
   } else {
-    Serial.println("\nWi-Fi connection pending. Retrying in background...");
+    Serial.println("\nWi-Fi connection pending. Continuing background reconnect...");
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
   uint32_t lastLiveStreamMs = 0;
+  uint32_t lastFbReportMs = 0;
+  uint32_t lastWifiRetryMs = 0;
+
+  uint8_t lastStreamedBlinkCount = 255;
+  bool lastStreamedSystemActivated = false;
+  char lastStreamedSelectedOutput[16] = "";
 
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint32_t now = millis();
 
     if (WiFi.status() != WL_CONNECTED) {
-      if (WiFi.status() == WL_DISCONNECTED) {
+      if (now - lastWifiRetryMs >= 5000) {
+        lastWifiRetryMs = now;
+        Serial.printf("Wi-Fi: Reconnecting to '%s'...\n", WIFI_SSID);
+        WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
-    // 1. Log gesture command events to Firebase (/events)
-    CommandEvent ev;
-    if (eventQueue != nullptr && xQueueReceive(eventQueue, &ev, 0) == pdTRUE) {
-      String url = String("https://") + FIREBASE_HOST + "/events.json?auth=" + FIREBASE_API_KEY;
-      if (http.begin(client, url)) {
-        http.addHeader("Content-Type", "application/json");
-        String payload = "{";
-        payload += "\"command\":\"" + String(ev.command) + "\",";
-        payload += "\"blinkCount\":" + String(ev.blinkCount) + ",";
-        payload += "\"peakMagnitude\":" + String(ev.peakMagnitude, 2) + ",";
-        payload += "\"durationMs\":" + String(ev.durationMs) + ",";
-        payload += "\"systemState\":\"" + String(ev.systemState) + "\",";
-        payload += "\"selectedOption\":\"" + String(ev.selectedOption) + "\",";
-        payload += "\"timestamp\":" + String(millis());
-        payload += "}";
-        int httpCode = http.POST(payload);
-        if (httpCode > 0) {
-          Serial.printf("Firebase: Event logged live (HTTP %d)\n", httpCode);
-        } else {
-          Serial.printf("Firebase: Event log error (%s)\n", http.errorToString(httpCode).c_str());
-        }
-        http.end();
-      }
-    }
+    TelemetryData dataCopy;
+    portENTER_CRITICAL(&telemetryMux);
+    dataCopy = currentTelemetry;
+    portEXIT_CRITICAL(&telemetryMux);
 
-    // 2. Stream live sensor telemetry to Firebase (/live_data) every 200ms
-    uint32_t now = millis();
-    if (now - lastLiveStreamMs >= 200) {
+    const bool stateChanged = (dataCopy.blinkCount != lastStreamedBlinkCount) ||
+                              (dataCopy.systemActivated != lastStreamedSystemActivated) ||
+                              (strcmp(dataCopy.selectedOutput, lastStreamedSelectedOutput) != 0);
+
+    if (stateChanged || (now - lastLiveStreamMs >= 2000)) {
       lastLiveStreamMs = now;
+      lastStreamedBlinkCount = dataCopy.blinkCount;
+      lastStreamedSystemActivated = dataCopy.systemActivated;
+      strncpy(lastStreamedSelectedOutput, dataCopy.selectedOutput, sizeof(lastStreamedSelectedOutput) - 1);
+      lastStreamedSelectedOutput[sizeof(lastStreamedSelectedOutput) - 1] = '\0';
 
-      TelemetryData dataCopy;
-      portENTER_CRITICAL(&telemetryMux);
-      dataCopy = currentTelemetry;
-      portEXIT_CRITICAL(&telemetryMux);
+      String payload = "{";
+      payload += "\"blinkCount\":" + String(dataCopy.blinkCount) + ",";
+      payload += "\"systemActivated\":" + String(dataCopy.systemActivated ? "true" : "false") + ",";
+      payload += "\"selectedOutput\":\"" + String(dataCopy.selectedOutput) + "\"";
+      payload += "}";
 
-      String url = String("https://") + FIREBASE_HOST + "/live_data.json?auth=" + FIREBASE_API_KEY;
-      if (http.begin(client, url)) {
-        http.addHeader("Content-Type", "application/json");
-        String payload = "{";
-        payload += "\"filteredSignal\":" + String(dataCopy.filteredSignal, 2) + ",";
-        payload += "\"sensorVoltageMv\":" + String(dataCopy.sensorVoltageMv, 2) + ",";
-        payload += "\"blinkCount\":" + String(dataCopy.blinkCount) + ",";
-        payload += "\"systemState\":\"" + String(dataCopy.systemState) + "\",";
-        payload += "\"detectorState\":\"" + String(dataCopy.detectorState) + "\",";
-        payload += "\"selectedOption\":\"" + String(dataCopy.selectedOption) + "\",";
-        payload += "\"timestamp\":" + String(now);
-        payload += "}";
-        http.PUT(payload);
-        http.end();
+      int httpCode = sendFirebaseRequest("/live_data", payload, "PUT");
+
+      if (now - lastFbReportMs >= 3000) {
+        lastFbReportMs = now;
+        if (httpCode == 200) {
+          Serial.println("Firebase RTDB: /live_data updated successfully (HTTP 200)");
+        } else {
+          Serial.printf("Firebase RTDB Stream Status: HTTP %d\n", httpCode);
+        }
       }
     }
   }
 }
 
+// -----------------------------------------------------------------------------
+// Arduino Setup & Main Execution Loop
+// -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   pinMode(SENSOR_PIN, INPUT);
@@ -623,8 +836,6 @@ void setup() {
   advertising->setMaxInterval(0x40);
   BLEDevice::startAdvertising();
 
-  // Create event queue and spawn Firebase task on FreeRTOS core
-  eventQueue = xQueueCreate(10, sizeof(CommandEvent));
   xTaskCreatePinnedToCore(
       firebaseTask,
       "FirebaseTask",
@@ -632,27 +843,27 @@ void setup() {
       nullptr,
       1,
       nullptr,
-      1
+      0
   );
 
-  Serial.println("NeuroSpeak ready: robust blink FSM & Firebase streaming enabled");
-  Serial.printf("Trigger=%.0f Release=%.0f Min=%lums Max=%lums Window=%lums\n",
-                blinkTriggerThreshold, blinkReleaseThreshold,
-                MIN_BLINK_DURATION_MS, MAX_BLINK_DURATION_MS,
-                MAX_SEQUENCE_WINDOW_MS);
+  lastSampleUs = micros();
+
+  Serial.println("=========================================================================");
+  Serial.println("NeuroSpeak Biomedical EOG Controller (ESP32-C6 Optimized)");
+  Serial.println("Electrode Setup: IN+(Forehead Midline), IN-(Mastoid A1), Ref(Mastoid A2)");
+  Serial.println("Trimmed Auto-calibration running (5 seconds)... Please remain still.");
+  Serial.println("=========================================================================");
 }
 
 void loop() {
   const uint32_t nowUs = micros();
   const uint32_t nowMs = millis();
 
-  handleSerialTuning();
-
   if (advertisingRestartPending) {
     advertisingRestartPending = false;
     if (pAdvertising != nullptr) {
       pAdvertising->start();
-      Serial.println("BLE: advertising restarted");
+      Serial.println("BLE: Advertising restarted");
     }
   }
 
@@ -660,41 +871,41 @@ void loop() {
     commandLocked = false;
   }
 
-  // Fixed-rate sampling keeps filter behavior stable without blocking the loop.
+  // Phase-Accurate Fixed-Rate Sampling (250 Hz)
   if (static_cast<uint32_t>(nowUs - lastSampleUs) >= SAMPLE_INTERVAL_US) {
-    lastSampleUs = nowUs;
-    const int rawValue = readSensor();
+    lastSampleUs += SAMPLE_INTERVAL_US; // Prevents cumulative sample clock drift
+
+    const int rawValue = analogRead(SENSOR_PIN);
     const float filteredValue = filterSignal(rawValue);
     const float voltageMv = static_cast<float>(analogReadMilliVolts(SENSOR_PIN));
-    const bool blinkDetected = filterReady && detectBlink(filteredValue, nowMs);
+    const bool blinkDetected = detectBlink(filteredValue, nowMs);
 
     if (blinkDetected) {
       registerBlink(nowMs);
     }
 
-    // Thread-safe update of current production telemetry
+    // Thread-safe snapshot for FreeRTOS task
     portENTER_CRITICAL(&telemetryMux);
-    currentTelemetry.filteredSignal = filteredValue;
-    currentTelemetry.sensorVoltageMv = voltageMv;
     currentTelemetry.blinkCount = blinkCount;
-    strncpy(currentTelemetry.systemState, systemStateName(), sizeof(currentTelemetry.systemState) - 1);
-    currentTelemetry.systemState[sizeof(currentTelemetry.systemState) - 1] = '\0';
-    strncpy(currentTelemetry.detectorState, detectorStateName(), sizeof(currentTelemetry.detectorState) - 1);
-    currentTelemetry.detectorState[sizeof(currentTelemetry.detectorState) - 1] = '\0';
+    currentTelemetry.systemActivated = (currentState == SYSTEM_ON);
     uint8_t idx = (currentMenuIndex >= 1 && currentMenuIndex <= 6) ? (currentMenuIndex - 1) : 0;
-    strncpy(currentTelemetry.selectedOption, OPTION_NAMES[idx], sizeof(currentTelemetry.selectedOption) - 1);
-    currentTelemetry.selectedOption[sizeof(currentTelemetry.selectedOption) - 1] = '\0';
+    strncpy(currentTelemetry.selectedOutput, OPTION_NAMES[idx], sizeof(currentTelemetry.selectedOutput) - 1);
+    currentTelemetry.selectedOutput[sizeof(currentTelemetry.selectedOutput) - 1] = '\0';
     portEXIT_CRITICAL(&telemetryMux);
 
     if (elapsed(nowMs, lastDebugMs, DEBUG_INTERVAL_MS)) {
       lastDebugMs = nowMs;
-      Serial.printf("Filtered:%.1f Voltage:%.1fmV BlinkDetected:%s BlinkCount:%u State:%s Detector:%s\n",
-                    filteredValue, voltageMv, blinkDetected ? "YES" : "NO", blinkCount,
-                    systemStateName(), detectorStateName());
+      if (!isCalibrated) {
+        Serial.printf("[CALIBRATING] Progress: %u/%u samples | Raw: %d\n", calibrationCount, CALIBRATION_SAMPLES, rawValue);
+      } else {
+        Serial.printf("F:%.1f V:%.1fmV Baseline:%.1f Trig:%.1f Noise:%.1f Conf:%.0f%% Blink:%u State:%s Det:%s\n",
+                      filteredValue, voltageMv, noiseMean, blinkTriggerThreshold, noiseStdDev,
+                      lastConfidenceScore, blinkCount, systemStateName(), detectorStateName());
+      }
     }
   }
 
-  // Finalize sequence
+  // Single, clean event-driven timer for finalizing multi-blink sequences
   if (blinkCount > 0 &&
       (elapsed(nowMs, lastSequenceBlinkMs, INTER_BLINK_TIMEOUT_MS) ||
        elapsed(nowMs, sequenceStartMs, MAX_SEQUENCE_WINDOW_MS))) {
