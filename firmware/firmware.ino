@@ -1,32 +1,12 @@
 /*
  * NeuroSpeak - High-Precision Biomedical EOG Eye-Blink Assistive Controller
- * Hardware: ESP32-C6 Microcontroller + Upside Down Labs NPG Lite / BioAmp EXG Pill
- *
- * Electrode Placement (Official M2W Configuration):
- *   - IN+  (Non-inverting / +ve): Middle of Forehead (Fpz) or Above Eye
- *   - IN-  (Inverting / -ve)    : Bony part behind ear (Mastoid Process A1) or Below Eye
- *   - REF  (Reference / Ground) : Opposite Mastoid Process (A2)
- *
- * Electrophysiological Principles:
- *   The eye functions as an electric dipole (cornea positive relative to retina).
- *   During a blink, Bell's phenomenon causes the eyeball to rotate upwards,
- *   generating a prominent positive potential transient (+100mV to +800mV scaled).
- *
- * Signal Processing Pipeline (Production Engineering Refactor):
- *   1. Fixed-Phase Sample Clock: 250 Hz sampling (4000 µs) with zero cumulative jitter.
- *   2. Median Filter Warmup (N=3): Rejects impulse noise without 0.0 startup step transients.
- *   3. Baseline-Subtracted 0.5Hz IIR HPF: Eliminates DC offset and electrode polarization drift.
- *   4. Precision 50Hz Biquad Notch Filter: Suppresses powerline electromagnetic interference.
- *   5. 12Hz 2nd-Order Low-Pass Butterworth Filter: Removes EMG muscle artifacts and high-freq noise.
- *   6. Smoothed Teager-Kaiser Energy Profile (TKEO): Enhances blink peak localization.
- *   7. Outlier-Resistant Boot Calibration: 5-second trimmed mean & 2.5-sigma variance estimation.
- *   8. Gated Continuous Baseline Tracking (EMV): Baseline updates ONLY during quiet idle states.
- *   9. Dynamic Hysteresis Thresholding: Dynamic trigger and release thresholds scaled by sigma.
- *  10. 6-State Finite State Machine (FSM): READY -> RISING -> PEAK -> FALLING -> REFRACTORY.
- *  11. Multi-Feature Bio-Confidence Engine (100 Points): Evaluates SNR, physiological duration,
- *      bio-asymmetry (fast rise / slow fall ratio), and derivative variance (EMG rejection).
- *  12. Optimized Sequence Classifier: Low-latency 420ms inter-blink window with instant 4-blink dispatch.
- *  13. Thread-Safe BLE & Firebase RTDB (/live_data) Integration.
+ * Hardware: ESP32-C6 Microcontroller + Upside Down Labs BioAmp EXG Pill
+ * 
+ * Custom Control Sequence:
+ *  - 4 Blinks: Activate System (Sends 1-byte BLE '0')
+ *  - 1 Blink:  Next Menu Item (Sends 2-byte BLE 'S' + Index)
+ *  - 2 Blinks: Select Item    (Sends 2-byte BLE 'A' + Index)
+ *  - 4 Blinks or 10s Timeout: Deactivate (Sends 1-byte BLE '127')
  */
 
 #include <BLEDevice.h>
@@ -37,8 +17,6 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <math.h>
-#include "BlinkDetector.h"
-#include "SequenceClassifier.h"
 
 // -----------------------------------------------------------------------------
 // Network & Hardware Configuration
@@ -54,111 +32,121 @@ constexpr uint8_t BLE_SYSTEM_ACTIVATED = 0;
 constexpr uint8_t BLE_SYSTEM_INACTIVE = 127;
 
 constexpr uint8_t SENSOR_PIN = 0;               // GPIO0 / ADC1_CH0 on ESP32-C6
-constexpr uint32_t SAMPLE_INTERVAL_US = 2000;   // 500 Hz exact sample clock
-constexpr uint32_t DEBUG_INTERVAL_MS = 20;      // 50 Hz Plotter telemetry rate
-
-// Uncomment for compact Arduino Serial Plotter-compatible detector telemetry.
-// #define DEBUG_BLINK
+constexpr uint32_t SAMPLE_RATE = 512;           // MUST be 512 for UDL Filters
+constexpr uint32_t SAMPLE_INTERVAL_US = 1953;   // 1000000 / 512 Hz
 
 const char *OPTION_NAMES[6] = {
-    "Food", "Help", "Outing", "Television", "Washroom", "Water"};
+    "Food", "Help", "Outing", "Television", "Washroom", "Water"
+};
 
 // -----------------------------------------------------------------------------
-// BLE Global Controls
+// UDL Signal Processing Buffers (512Hz Tuned)
+// -----------------------------------------------------------------------------
+#define ENVELOPE_WINDOW_MS 100 
+#define ENVELOPE_WINDOW_SIZE ((ENVELOPE_WINDOW_MS * SAMPLE_RATE) / 1000)
+
+float envelopeBuffer[ENVELOPE_WINDOW_SIZE] = {0};
+int envelopeIndex = 0;
+float envelopeSum = 0;
+float currentEEGEnvelope = 0;
+float BlinkThreshold = 50.0;
+
+// -----------------------------------------------------------------------------
+// Sequence Classifier Variables
+// -----------------------------------------------------------------------------
+const uint32_t BLINK_DEBOUNCE_MS = 250;       // Minimum time between physical blinks
+const uint32_t SEQUENCE_TIMEOUT_MS = 1000;    // Time to wait after last blink to lock in command
+const uint32_t MENU_TIMEOUT_MS = 10000;       // 10 seconds of inactivity turns off system
+
+uint32_t lastBlinkTime = 0;
+uint32_t lastActivityTime = 0;
+int currentBlinkSequenceCount = 0;
+
+// -----------------------------------------------------------------------------
+// BLE Global Controls & State
 // -----------------------------------------------------------------------------
 BLEServer *pServer = nullptr;
 BLECharacteristic *pCharacteristic = nullptr;
 BLEAdvertising *pAdvertising = nullptr;
 bool deviceConnected = false;
 volatile bool advertisingRestartPending = false;
-volatile int lastFirebaseHttpCode = -1;  // Debug telemetry only; Firebase payload is unchanged.
-uint8_t lastBleAction = 0;
-uint8_t lastBleIndex = 0;
 
-constexpr uint32_t COMMAND_LOCKOUT_MS = 400;
-
-// -----------------------------------------------------------------------------
-// State Machine Definitions
-// -----------------------------------------------------------------------------
-enum SystemState : uint8_t {
-  SYSTEM_OFF,
-  SYSTEM_ON
-};
-
+enum SystemState : uint8_t { SYSTEM_OFF, SYSTEM_ON };
 SystemState currentState = SYSTEM_OFF;
-BlinkDetector blinkDetector;
-SequenceClassifier sequenceClassifier;
 
-// Sequence tracking
 constexpr uint8_t FIRST_MENU_ITEM = 1;
 constexpr uint8_t MAX_MENU_ITEMS = 6;
 uint8_t currentMenuIndex = FIRST_MENU_ITEM;
 
-bool commandLocked = false;
-uint32_t commandLockoutStartMs = 0;
-
 uint32_t lastSampleUs = 0;
-uint32_t lastDebugMs = 0;
-uint32_t sampleDeadlineMisses = 0;
-uint32_t worstSampleLatenessUs = 0;
 
-// Thread-Safe Telemetry Snapshot for Firebase
 struct TelemetryData {
   uint8_t blinkCount;
   bool systemActivated;
   char selectedOutput[16];
 };
-
 TelemetryData currentTelemetry = {0, false, "Food"};
 portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
 
 // -----------------------------------------------------------------------------
-// Helper Functions
+// UDL Digital Filters (Generated via filter_gen.py @ 512Hz)
 // -----------------------------------------------------------------------------
-const char *systemStateName() {
-  return currentState == SYSTEM_ON ? "ON" : "OFF";
-}
-
-inline bool elapsed(uint32_t now, uint32_t since, uint32_t duration) {
-  return static_cast<uint32_t>(now - since) >= duration;
-}
-
-inline float medianOfThree(float a, float b, float c) {
-  if (a > b) { float t = a; a = b; b = t; }
-  if (b > c) { float t = b; b = c; c = t; }
-  if (a > b) { float t = a; a = b; b = t; }
-  return b;
-}
-
-// Quick select / partition algorithm for fast trimmed mean computation
-void quickSelect(float arr[], int l, int r, int k) {
-  while (l < r) {
-    float pivot = arr[r];
-    int i = l - 1;
-    for (int j = l; j < r; j++) {
-      if (arr[j] <= pivot) {
-        i++;
-        float t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-      }
-    }
-    float t = arr[i + 1]; arr[i + 1] = arr[r]; arr[r] = t;
-    int pivotIdx = i + 1;
-
-    if (pivotIdx == k) return;
-    else if (pivotIdx < k) l = pivotIdx + 1;
-    else r = pivotIdx - 1;
+float highpass(float input) {
+  float output = input;
+  {
+    static float z1, z2;
+    float x = output - -1.91327599*z1 - 0.91688335*z2;
+    output = 0.95753983*x + -1.91507967*z1 + 0.95753983*z2;
+    z2 = z1; z1 = x;
   }
+  return output;
+}
+
+float Notch(float input) {
+  float output = input;
+  {
+    static float z1, z2;
+    float x = output - -1.58696045*z1 - 0.96505858*z2;
+    output = 0.96588529*x + -1.57986211*z1 + 0.96588529*z2;
+    z2 = z1; z1 = x;
+  }
+  {
+    static float z1, z2;
+    float x = output - -1.62761184*z1 - 0.96671306*z2;
+    output = 1.00000000*x + -1.63566226*z1 + 1.00000000*z2;
+    z2 = z1; z1 = x;
+  }
+  return output;
+}
+
+float EEGFilter(float input) {
+  float output = input;
+  {
+    static float z1, z2;
+    float x = output - -1.24200128*z1 - 0.45885207*z2;
+    output = 0.05421270*x + 0.10842539*z1 + 0.05421270*z2;
+    z2 = z1; z1 = x;
+  }
+  return output;
+}
+
+float updateEEGEnvelope(float sample) {
+  float absSample = fabs(sample);
+  envelopeSum -= envelopeBuffer[envelopeIndex];
+  envelopeSum += absSample;
+  envelopeBuffer[envelopeIndex] = absSample;
+  envelopeIndex = (envelopeIndex + 1) % ENVELOPE_WINDOW_SIZE;
+  return envelopeSum / ENVELOPE_WINDOW_SIZE;
 }
 
 // -----------------------------------------------------------------------------
-// BLE Callbacks
+// BLE Callbacks & Transmitters
 // -----------------------------------------------------------------------------
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     deviceConnected = true;
     Serial.println("BLE: Client connected");
   }
-
   void onDisconnect(BLEServer *server) override {
     deviceConnected = false;
     advertisingRestartPending = true;
@@ -168,149 +156,74 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 class DataCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
-    String value = characteristic->getValue();
-    if (value.length() < 2) return;
-
-    const uint8_t tag = static_cast<uint8_t>(value[0]);
-    const uint8_t idx = static_cast<uint8_t>(value[1]);
-    const bool idxValid = (idx >= 1 && idx <= 6);
-
-    switch (tag) {
-      case 's':
-        Serial.printf("Web ACK: Menu highlight -> %s (idx %u)\n", idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
-        break;
-      case 'a':
-        Serial.printf("Web ACK: Selected -> %s (idx %u)\n", idxValid ? OPTION_NAMES[idx - 1] : "?", idx);
-        break;
-      case 'x':
-        Serial.printf("Web ACK: System %s\n", idx ? "ACTIVE" : "INACTIVE");
-        break;
+    String value = characteristic->getValue(); // FIXED: Changed to Arduino String
+    if (value.length() >= 2) {
+      char tag = value[0];
+      uint8_t idx = value[1];
+      // Prints acknowledgment from the React Web App to verify closed loop
+      Serial.printf("Web ACK Received -> Tag: %c, Index: %u\n", tag, idx);
     }
   }
 };
 
 void sendBLEMenuAction(char action, uint8_t index) {
   if (!deviceConnected) return;
-  uint8_t payload[2] = {static_cast<uint8_t>(action), index};
-  pCharacteristic->setValue(payload, sizeof(payload));
+  
+  if (action == 'X') {
+    // Send exactly 1 byte for System ON (0) or OFF (127) - Matches Mainpage.tsx logic[cite: 1]
+    uint8_t payload[1] = {index};
+    pCharacteristic->setValue(payload, 1);
+  } else {
+    // Send exactly 2 bytes for Navigate ('S') and Select ('A') - Matches Mainpage.tsx logic[cite: 1]
+    uint8_t payload[2] = {static_cast<uint8_t>(action), index};
+    pCharacteristic->setValue(payload, 2);
+  }
   pCharacteristic->notify();
-  lastBleAction = static_cast<uint8_t>(action);
-  lastBleIndex = index;
 }
 
 // -----------------------------------------------------------------------------
-// Optimized Sequence Classifier & Menu FSM
+// Telemetry & Firebase Task
 // -----------------------------------------------------------------------------
-void executeBlinkCommand(BlinkCommand command, uint32_t nowMs) {
-  if (commandLocked) {
-    Serial.println("Blink ignored: Command lockout active");
-    return;
-  }
-  const char *executedCommand = "Ignored: Unsupported sequence";
-
-  switch (command) {
-    case BlinkCommand::Single:
-      if (currentState == SYSTEM_ON) {
-        currentMenuIndex = (currentMenuIndex % MAX_MENU_ITEMS) + 1;
-        sendBLEMenuAction('S', currentMenuIndex);
-        executedCommand = "Rotate menu";
-      } else {
-        executedCommand = "Ignored: System OFF";
-      }
-      break;
-
-    case BlinkCommand::Double:
-      if (currentState == SYSTEM_ON) {
-        sendBLEMenuAction('A', currentMenuIndex);
-        executedCommand = "Select highlighted option";
-      } else {
-        executedCommand = "Ignored: System OFF";
-      }
-      break;
-
-    case BlinkCommand::Quad:
-      currentState = (currentState == SYSTEM_OFF) ? SYSTEM_ON : SYSTEM_OFF;
-      sendBLEMenuAction('X', currentState == SYSTEM_ON ? BLE_SYSTEM_ACTIVATED : BLE_SYSTEM_INACTIVE);
-      executedCommand = (currentState == SYSTEM_ON) ? "System Activated (ON)" : "System Deactivated (OFF)";
-      break;
-
-    default:
-      break;
-  }
-
-  commandLocked = true;
-  commandLockoutStartMs = nowMs;
-  Serial.printf(">>> EXECUTE COMMAND: %s <<<\n", executedCommand);
+void updateTelemetry(uint8_t blinkCount) {
+    portENTER_CRITICAL(&telemetryMux);
+    currentTelemetry.blinkCount = blinkCount;
+    currentTelemetry.systemActivated = (currentState == SYSTEM_ON);
+    uint8_t idx = (currentMenuIndex >= 1 && currentMenuIndex <= 6) ? (currentMenuIndex - 1) : 0;
+    strncpy(currentTelemetry.selectedOutput, OPTION_NAMES[idx], sizeof(currentTelemetry.selectedOutput) - 1);
+    currentTelemetry.selectedOutput[sizeof(currentTelemetry.selectedOutput) - 1] = '\0';
+    portEXIT_CRITICAL(&telemetryMux);
 }
 
-// -----------------------------------------------------------------------------
-// Firebase Realtime Database Task (/live_data)
-// -----------------------------------------------------------------------------
 int sendFirebaseRequest(const char *nodePath, const String &payload, const char *httpMethod) {
-  if (WiFi.status() != WL_CONNECTED) {
-    return -1;
-  }
+  if (WiFi.status() != WL_CONNECTED) return -1;
 
-  String urlNoAuth = String("https://") + FIREBASE_HOST + nodePath + ".json";
   String urlAuth = String("https://") + FIREBASE_HOST + nodePath + ".json?auth=" + FIREBASE_API_KEY;
-
   int httpCode = -1;
 
-  {
-    WiFiClientSecure secClient;
-    secClient.setInsecure();
-    HTTPClient http;
-    http.setTimeout(6000);
+  WiFiClientSecure secClient;
+  secClient.setInsecure();
+  HTTPClient http;
+  http.setTimeout(6000);
 
-    if (http.begin(secClient, urlNoAuth)) {
-      http.addHeader("Content-Type", "application/json");
-      httpCode = http.sendRequest(httpMethod, payload);
-      http.end();
-    }
+  if (http.begin(secClient, urlAuth)) {
+    http.addHeader("Content-Type", "application/json");
+    httpCode = http.sendRequest(httpMethod, payload);
+    http.end();
   }
-
-  if (httpCode != 200 && httpCode != 201) {
-    WiFiClientSecure secClient;
-    secClient.setInsecure();
-    HTTPClient http;
-    http.setTimeout(6000);
-
-    if (http.begin(secClient, urlAuth)) {
-      http.addHeader("Content-Type", "application/json");
-      int retryCode = http.sendRequest(httpMethod, payload);
-      if (retryCode == 200 || retryCode == 201) {
-        httpCode = retryCode;
-      }
-      http.end();
-    }
-  }
-
   return httpCode;
 }
 
 void firebaseTask(void *pvParameters) {
   Serial.printf("Wi-Fi: Connecting to SSID '%s'...\n", WIFI_SSID);
-  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(pdMS_TO_TICKS(500));
-    Serial.print(".");
-    attempts++;
   }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi connected! IP address: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\nWi-Fi connection pending. Continuing background reconnect...");
-  }
+  Serial.println("\nWi-Fi connected!");
 
   uint32_t lastLiveStreamMs = 0;
-  uint32_t lastFbReportMs = 0;
-  uint32_t lastWifiRetryMs = 0;
-
   uint8_t lastStreamedBlinkCount = 255;
   bool lastStreamedSystemActivated = false;
   char lastStreamedSelectedOutput[16] = "";
@@ -319,16 +232,7 @@ void firebaseTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
     uint32_t now = millis();
 
-    if (WiFi.status() != WL_CONNECTED) {
-      if (now - lastWifiRetryMs >= 5000) {
-        lastWifiRetryMs = now;
-        Serial.printf("Wi-Fi: Reconnecting to '%s'...\n", WIFI_SSID);
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      }
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
+    if (WiFi.status() != WL_CONNECTED) continue;
 
     TelemetryData dataCopy;
     portENTER_CRITICAL(&telemetryMux);
@@ -344,31 +248,20 @@ void firebaseTask(void *pvParameters) {
       lastStreamedBlinkCount = dataCopy.blinkCount;
       lastStreamedSystemActivated = dataCopy.systemActivated;
       strncpy(lastStreamedSelectedOutput, dataCopy.selectedOutput, sizeof(lastStreamedSelectedOutput) - 1);
-      lastStreamedSelectedOutput[sizeof(lastStreamedSelectedOutput) - 1] = '\0';
-
+      
       String payload = "{";
       payload += "\"blinkCount\":" + String(dataCopy.blinkCount) + ",";
       payload += "\"systemActivated\":" + String(dataCopy.systemActivated ? "true" : "false") + ",";
       payload += "\"selectedOutput\":\"" + String(dataCopy.selectedOutput) + "\"";
       payload += "}";
 
-      int httpCode = sendFirebaseRequest("/live_data", payload, "PUT");
-      lastFirebaseHttpCode = httpCode;
-
-      if (now - lastFbReportMs >= 3000) {
-        lastFbReportMs = now;
-        if (httpCode == 200) {
-          Serial.println("Firebase RTDB: /live_data updated successfully (HTTP 200)");
-        } else {
-          Serial.printf("Firebase RTDB Stream Status: HTTP %d\n", httpCode);
-        }
-      }
+      sendFirebaseRequest("/live_data", payload, "PUT");
     }
   }
 }
 
 // -----------------------------------------------------------------------------
-// Arduino Setup & Main Execution Loop
+// Arduino Setup & Loop
 // -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
@@ -384,113 +277,96 @@ void setup() {
   pCharacteristic = service->createCharacteristic(
       CHARACTERISTIC_UUID,
       BLECharacteristic::PROPERTY_READ |
-          BLECharacteristic::PROPERTY_WRITE |
-          BLECharacteristic::PROPERTY_NOTIFY |
-          BLECharacteristic::PROPERTY_INDICATE);
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_NOTIFY |
+      BLECharacteristic::PROPERTY_INDICATE);
+      
   pCharacteristic->addDescriptor(new BLE2902());
   pCharacteristic->setCallbacks(new DataCallbacks());
   service->start();
 
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   pAdvertising = advertising;
-
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
   advData.setCompleteServices(BLEUUID(SERVICE_UUID));
   advertising->setAdvertisementData(advData);
-
-  BLEAdvertisementData scanResponseData;
-  scanResponseData.setName("ESP32C6_EEG");
-  advertising->setScanResponseData(scanResponseData);
-
   advertising->setScanResponse(true);
-  advertising->setMinPreferred(0x06);
-  advertising->setMinInterval(0x20);
-  advertising->setMaxInterval(0x40);
   BLEDevice::startAdvertising();
 
-  xTaskCreatePinnedToCore(
-      firebaseTask,
-      "FirebaseTask",
-      8192,
-      nullptr,
-      1,
-      nullptr,
-      0
-  );
+  xTaskCreatePinnedToCore(firebaseTask, "FirebaseTask", 8192, nullptr, 1, nullptr, 0);
 
-  blinkDetector.begin();
   lastSampleUs = micros();
-
-  Serial.println("=========================================================================");
-  Serial.println("NeuroSpeak Biomedical EOG Controller (ESP32-C6 Optimized)");
-  Serial.println("Electrode Setup: IN+(Forehead Midline), IN-(Mastoid A1), Ref(Mastoid A2)");
-  Serial.println("Robust auto-calibration running (4 seconds)... Please remain still.");
-  Serial.println("=========================================================================");
+  Serial.println("NeuroSpeak Biomedical EOG Controller Ready.");
 }
 
 void loop() {
-  const uint32_t nowUs = micros();
-  const uint32_t nowMs = millis();
+  uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
 
   if (advertisingRestartPending) {
     advertisingRestartPending = false;
-    if (pAdvertising != nullptr) {
-      pAdvertising->start();
-      Serial.println("BLE: Advertising restarted");
-    }
+    if (pAdvertising != nullptr) pAdvertising->start();
   }
 
-  if (commandLocked && elapsed(nowMs, commandLockoutStartMs, COMMAND_LOCKOUT_MS)) {
-    commandLocked = false;
-  }
-
-  // Fixed-rate 500 Hz sampling. A late loop skips stale sample slots rather than
-  // bursting conversions; deadline loss is recorded for clinical debugging.
+  // 1. Process Signal strictly at 512 Hz
   if (static_cast<uint32_t>(nowUs - lastSampleUs) >= SAMPLE_INTERVAL_US) {
-    const uint32_t latenessUs = nowUs - lastSampleUs;
-    if (latenessUs >= 2 * SAMPLE_INTERVAL_US) {
-      sampleDeadlineMisses += latenessUs / SAMPLE_INTERVAL_US - 1;
-      lastSampleUs = nowUs;
-    } else {
-      lastSampleUs += SAMPLE_INTERVAL_US;
+    lastSampleUs += SAMPLE_INTERVAL_US;
+    
+    int raw = analogRead(SENSOR_PIN);
+    float filt = EEGFilter(Notch(raw));
+    float filtered = highpass(filt);
+    currentEEGEnvelope = updateEEGEnvelope(filtered);
+
+    // 2. Detect Blink with Debounce
+    if (currentEEGEnvelope > BlinkThreshold && (nowMs - lastBlinkTime) >= BLINK_DEBOUNCE_MS) {
+        lastBlinkTime = nowMs;
+        lastActivityTime = nowMs; // Reset inactivity timer
+        currentBlinkSequenceCount++;
+        Serial.printf("Blink Logged! Sequence Count: %d\n", currentBlinkSequenceCount);
     }
-    if (latenessUs > worstSampleLatenessUs) worstSampleLatenessUs = latenessUs;
-
-    const uint16_t rawValue = static_cast<uint16_t>(analogRead(SENSOR_PIN));
-    const bool blinkDetected = blinkDetector.process(rawValue, nowMs);
-
-    if (blinkDetected) {
-      const BlinkCommand command = sequenceClassifier.add(nowMs);
-      if (command != BlinkCommand::None) executeBlinkCommand(command, nowMs);
-    }
-
-    // Thread-safe snapshot for FreeRTOS task
-    portENTER_CRITICAL(&telemetryMux);
-    currentTelemetry.blinkCount = sequenceClassifier.count();
-    currentTelemetry.systemActivated = (currentState == SYSTEM_ON);
-    uint8_t idx = (currentMenuIndex >= 1 && currentMenuIndex <= 6) ? (currentMenuIndex - 1) : 0;
-    strncpy(currentTelemetry.selectedOutput, OPTION_NAMES[idx], sizeof(currentTelemetry.selectedOutput) - 1);
-    currentTelemetry.selectedOutput[sizeof(currentTelemetry.selectedOutput) - 1] = '\0';
-    portEXIT_CRITICAL(&telemetryMux);
-
-    #ifdef DEBUG_BLINK
-    if (elapsed(nowMs, lastDebugMs, DEBUG_INTERVAL_MS)) {
-      lastDebugMs = nowMs;
-      // Named numeric fields are accepted by Arduino Serial Plotter.
-      Serial.printf("Raw:%u Filtered:%.2f Baseline:%.2f Noise:%.2f Threshold:%.2f NegThreshold:%.2f Peak:%.2f Prominence:%.2f NegPeak:%.2f Width:%u Duration:%u Energy:%.3f Confidence:%.1f Accepted:%u Rejected:%u Reason:%u FSM:%u Menu:%u BLEAction:%u BLEIndex:%u Firebase:%d Missed:%lu LateUs:%lu\n",
-                    rawValue, blinkDetector.filtered(), blinkDetector.baseline(), blinkDetector.noise(),
-                    blinkDetector.trigger(), blinkDetector.negativeTrigger(), blinkDetector.peak(),
-                    blinkDetector.prominence(), blinkDetector.negativePeak(), blinkDetector.widthMs(), blinkDetector.widthMs(), blinkDetector.energy(),
-                    blinkDetector.confidence(), blinkDetected ? 1 : 0,
-                    blinkDetector.rejectReason() == BlinkRejectReason::None ? 0 : 1,
-                    static_cast<unsigned>(blinkDetector.rejectReason()),
-                    static_cast<unsigned>(blinkDetector.state()), currentMenuIndex, lastBleAction, lastBleIndex, lastFirebaseHttpCode,
-                    sampleDeadlineMisses, worstSampleLatenessUs);
-    }
-    #endif
   }
 
-  const BlinkCommand completed = sequenceClassifier.poll(nowMs);
-  if (completed != BlinkCommand::None) executeBlinkCommand(completed, nowMs);
+  // 3. Evaluate Sequence Logic (Triggered after 1s of no blinking)
+  if (currentBlinkSequenceCount > 0 && (nowMs - lastBlinkTime) > SEQUENCE_TIMEOUT_MS) {
+      Serial.printf(">>> Sequence Executing: %d blinks <<<\n", currentBlinkSequenceCount);
+
+      if (currentBlinkSequenceCount == 4) {
+          // Toggle System Status
+          currentState = (currentState == SYSTEM_OFF) ? SYSTEM_ON : SYSTEM_OFF;
+          sendBLEMenuAction('X', currentState == SYSTEM_ON ? BLE_SYSTEM_ACTIVATED : BLE_SYSTEM_INACTIVE);
+          Serial.println(currentState == SYSTEM_ON ? "System Activated (ON)" : "System Deactivated (OFF)");
+          
+          if (currentState == SYSTEM_ON) {
+              currentMenuIndex = FIRST_MENU_ITEM; // Start at index 1
+          }
+      } 
+      else if (currentState == SYSTEM_ON) {
+          if (currentBlinkSequenceCount == 1) {
+              // Menu Rotation
+              currentMenuIndex = (currentMenuIndex % MAX_MENU_ITEMS) + 1;
+              sendBLEMenuAction('S', currentMenuIndex);
+              Serial.printf("Menu Navigated -> %s\n", OPTION_NAMES[currentMenuIndex - 1]);
+          } 
+          else if (currentBlinkSequenceCount == 2) {
+              // Command Select
+              sendBLEMenuAction('A', currentMenuIndex);
+              Serial.printf("Command Triggered -> %s\n", OPTION_NAMES[currentMenuIndex - 1]);
+          }
+      } else {
+          Serial.println("Ignored: System is currently OFF.");
+      }
+
+      updateTelemetry(currentBlinkSequenceCount);
+      currentBlinkSequenceCount = 0; // Reset for next sequence
+  }
+
+  // 4. Handle 10-Second Inactivity Timeout
+  if (currentState == SYSTEM_ON && (nowMs - lastActivityTime) > MENU_TIMEOUT_MS) {
+      Serial.println("10s Inactivity Timeout -> System Deactivated");
+      currentState = SYSTEM_OFF;
+      sendBLEMenuAction('X', BLE_SYSTEM_INACTIVE); 
+      updateTelemetry(0);
+      lastActivityTime = nowMs; // Prevent loop spam
+  }
 }

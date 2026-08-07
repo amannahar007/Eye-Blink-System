@@ -1,8 +1,8 @@
-# 👁️✨ Eye Blink System (Mind-to-World / M2W Web App) 🚀
+# 👁️✨ Eye Blink System (Mind-to-World / M2W) 🚀
 
-Hello little friend! 🖐️ Welcome to the **Eye Blink System Web App**! 
+Hello little friend! 🖐️ Welcome to the **Eye Blink System**! 
 
-Imagine you have **magic eyes**! 👀 When you blink, this computer screen talks back to you and helps you ask for **Water 💧**, **Food 🍕**, **Call Nurse 👩‍⚕️**, or turn on the **Lights 💡** — without using your hands at all! Isn't that super cool? 
+Imagine you have **magic eyes**! 👀 When you blink, a computer screen talks back to you and helps you ask for **Water 💧**, **Food 🍕**, **Call Nurse 👩‍⚕️**, or turn on the **Lights 💡** — without using your hands at all! Isn't that super cool? 
 
 ---
 
